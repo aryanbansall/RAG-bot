@@ -2,6 +2,7 @@ import streamlit as st
 import os
 import time
 import tempfile
+import hashlib
 from dotenv import load_dotenv
 from pymongo import MongoClient
 
@@ -78,7 +79,6 @@ def get_secret(key_name, fallback_key=None):
     if fallback_key:
         return os.getenv(fallback_key) or ""
     return ""
-
 
 # Retrieve configured keys
 default_groq_key = get_secret("API_KEY", "GROQ_API_KEY")
@@ -169,7 +169,7 @@ with st.sidebar:
         chunk_size = st.number_input("Chunk Size", min_value=100, max_value=4000, value=1000, step=100)
         chunk_overlap = st.number_input("Chunk Overlap", min_value=0, max_value=1000, value=200, step=50)
 
-    # Ingest documents into MongoDB Database
+    # Smart Incremental Ingestion to MongoDB with Rate Limit Retry & Deduplication
     def create_and_store_in_mongodb(show_toast=True):
         if not google_api_key_input:
             st.error("Google API Key is required to generate vector embeddings!")
@@ -210,42 +210,85 @@ with st.sidebar:
             st.error("No valid PDF documents found to ingest!")
             return False
 
-        with st.spinner("Generating embeddings & storing in MongoDB cluster..."):
+        with st.spinner("Processing documents & checking MongoDB cache..."):
             try:
                 text_splitter = RecursiveCharacterTextSplitter(chunk_size=chunk_size, chunk_overlap=chunk_overlap)
                 final_documents = text_splitter.split_documents(docs)
-                
                 embeddings = GoogleGenerativeAIEmbeddings(model="gemini-embedding-001", google_api_key=google_api_key_input)
                 
-                # Embed all document chunks
-                embed_texts = [d.page_content for d in final_documents]
-                vectors = embeddings.embed_documents(embed_texts)
-                
-                text_embeddings = [(d.page_content, v) for d, v in zip(final_documents, vectors)]
-                metadatas = [d.metadata for d in final_documents]
-                vector_store = FAISS.from_embeddings(text_embeddings=text_embeddings, embedding=embeddings, metadatas=metadatas)
-                
-                # Try persisting to MongoDB if connected
+                # Fetch existing cached vector hashes from MongoDB
+                existing_records = {}
                 if mongo_coll is not None:
                     try:
-                        mongo_coll.delete_many({})
-                        mongo_docs = []
-                        for doc, vec in zip(final_documents, vectors):
-                            mongo_docs.append({
-                                "text": doc.page_content,
-                                "metadata": doc.metadata,
-                                "embedding": vec
-                            })
-                        mongo_coll.insert_many(mongo_docs)
-                        if show_toast:
-                            st.success(f"🍃 Stored {len(final_documents)} vector embeddings in MongoDB database '{mongo_db_name}'!")
-                    except Exception as me:
-                        st.warning(f"⚠️ Vector index created locally, but could not write to MongoDB cluster: {me}. Ensure '0.0.0.0/0' is added to MongoDB Atlas Network Access.")
+                        for r in mongo_coll.find({}, {"doc_id": 1, "text": 1, "metadata": 1, "embedding": 1}):
+                            if "doc_id" in r:
+                                existing_records[r["doc_id"]] = r
+                    except Exception:
+                        pass
+
+                chunks_to_embed = []
+                cached_tuples = []
+
+                for doc in final_documents:
+                    doc_id = hashlib.sha256(f"{doc.page_content}:{doc.metadata.get('source')}:{doc.metadata.get('page')}".encode()).hexdigest()
+                    if doc_id in existing_records:
+                        rec = existing_records[doc_id]
+                        cached_tuples.append((rec["text"], rec["embedding"], rec["metadata"]))
+                    else:
+                        chunks_to_embed.append((doc_id, doc))
+
+                # Batch embed new chunks with 429 Rate Limit backoff retry
+                batch_size = 10
+                new_tuples = []
+                
+                if chunks_to_embed:
+                    progress_text = st.empty()
+                    for i in range(0, len(chunks_to_embed), batch_size):
+                        batch = chunks_to_embed[i:i+batch_size]
+                        batch_texts = [item[1].page_content for item in batch]
+                        progress_text.info(f"⚡ Generating embeddings for new chunks ({i+1}-{min(i+batch_size, len(chunks_to_embed))}/{len(chunks_to_embed)})...")
+                        
+                        for attempt in range(5):
+                            try:
+                                vecs = embeddings.embed_documents(batch_texts)
+                                mongo_inserts = []
+                                for (doc_id, doc), vec in zip(batch, vecs):
+                                    record = {
+                                        "doc_id": doc_id,
+                                        "text": doc.page_content,
+                                        "metadata": doc.metadata,
+                                        "embedding": vec
+                                    }
+                                    mongo_inserts.append(record)
+                                    new_tuples.append((doc.page_content, vec, doc.metadata))
+                                
+                                if mongo_coll is not None and mongo_inserts:
+                                    mongo_coll.insert_many(mongo_inserts)
+                                time.sleep(0.5)  # Stay within Google API Rate Limit
+                                break
+                            except Exception as e:
+                                err_str = str(e)
+                                if ("429" in err_str or "RESOURCE_EXHAUSTED" in err_str) and attempt < 4:
+                                    progress_text.warning(f"⏳ Rate limit hit. Pausing for 5 seconds before retrying batch {i//batch_size + 1}... (Attempt {attempt+1}/5)")
+                                    time.sleep(5)
+                                else:
+                                    raise e
+
+                    progress_text.empty()
+
+                all_tuples = cached_tuples + new_tuples
+                text_embeddings = [(t[0], t[1]) for t in all_tuples]
+                metadatas = [t[2] for t in all_tuples]
+                
+                vector_store = FAISS.from_embeddings(text_embeddings=text_embeddings, embedding=embeddings, metadatas=metadatas)
                 
                 st.session_state.vectors = vector_store
                 st.session_state.doc_count = len(docs)
-                st.session_state.chunk_count = len(final_documents)
+                st.session_state.chunk_count = len(all_tuples)
                 st.session_state.indexed_files = list(set(loaded_file_names))
+                
+                if show_toast:
+                    st.success(f"🍃 Ready! {len(cached_tuples)} chunks reused from cache, {len(new_tuples)} new chunks embedded into MongoDB.")
                 return True
             except Exception as e:
                 st.error(f"Error during ingestion: {e}")
