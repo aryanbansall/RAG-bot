@@ -65,16 +65,20 @@ st.markdown("""
 
 # Helper function to get secrets safely from Streamlit Secrets or Environment
 def get_secret(key_name, fallback_key=None):
-    if key_name in st.secrets:
-        return st.secrets[key_name]
-    if fallback_key and fallback_key in st.secrets:
-        return st.secrets[fallback_key]
+    try:
+        if key_name in st.secrets:
+            return st.secrets[key_name]
+        if fallback_key and fallback_key in st.secrets:
+            return st.secrets[fallback_key]
+    except Exception:
+        pass
     val = os.getenv(key_name)
     if val:
         return val
     if fallback_key:
         return os.getenv(fallback_key) or ""
     return ""
+
 
 # Retrieve configured keys
 default_groq_key = get_secret("API_KEY", "GROQ_API_KEY")
