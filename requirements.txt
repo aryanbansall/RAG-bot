@@ -9,3 +9,6 @@ langchain_community
 python-dotenv
 pypdf
 google-cloud-aiplatform>=1.38
+pymongo
+langchain-mongodb
+dnspython
