@@ -102,12 +102,13 @@ if "indexed_files" not in st.session_state:
 # MongoDB Connection Helper
 @st.cache_resource(show_spinner=False)
 def get_mongo_collection(uri, db_name, coll_name):
+    if not uri:
+        return None
     try:
-        client = MongoClient(uri, serverSelectionTimeoutMS=5000)
+        client = MongoClient(uri, serverSelectionTimeoutMS=4000)
         db = client[db_name]
         return db[coll_name]
-    except Exception as e:
-        st.error(f"MongoDB Connection Error: {e}")
+    except Exception:
         return None
 
 mongo_coll = get_mongo_collection(default_mongo_uri, mongo_db_name, mongo_collection_name)
@@ -170,10 +171,6 @@ with st.sidebar:
             st.error("Google API Key is required to generate vector embeddings!")
             return False
 
-        if mongo_coll is None:
-            st.error("MongoDB is not connected. Check connection URI.")
-            return False
-
         docs = []
         loaded_file_names = []
         
@@ -210,51 +207,56 @@ with st.sidebar:
             return False
 
         with st.spinner("Generating embeddings & storing in MongoDB cluster..."):
-            text_splitter = RecursiveCharacterTextSplitter(chunk_size=chunk_size, chunk_overlap=chunk_overlap)
-            final_documents = text_splitter.split_documents(docs)
-            
-            embeddings = GoogleGenerativeAIEmbeddings(model="gemini-embedding-001", google_api_key=google_api_key_input)
-            
-            # Embed all document chunks
-            embed_texts = [d.page_content for d in final_documents]
-            vectors = embeddings.embed_documents(embed_texts)
-            
-            # Clear previous MongoDB collection and insert new vector documents
-            mongo_coll.delete_many({})
-            mongo_docs = []
-            for doc, vec in zip(final_documents, vectors):
-                mongo_docs.append({
-                    "text": doc.page_content,
-                    "metadata": doc.metadata,
-                    "embedding": vec
-                })
-            
-            mongo_coll.insert_many(mongo_docs)
-            
-            # Construct active vector search index
-            text_embeddings = [(r["text"], r["embedding"]) for r in mongo_docs]
-            metadatas = [r["metadata"] for r in mongo_docs]
-            vector_store = FAISS.from_embeddings(text_embeddings=text_embeddings, embedding=embeddings, metadatas=metadatas)
-            
-            st.session_state.vectors = vector_store
-            st.session_state.doc_count = len(docs)
-            st.session_state.chunk_count = len(final_documents)
-            st.session_state.indexed_files = list(set(loaded_file_names))
-            
-            if show_toast:
-                st.success(f"🍃 Stored {len(final_documents)} vector embeddings in MongoDB database '{mongo_db_name}'!")
-            return True
+            try:
+                text_splitter = RecursiveCharacterTextSplitter(chunk_size=chunk_size, chunk_overlap=chunk_overlap)
+                final_documents = text_splitter.split_documents(docs)
+                
+                embeddings = GoogleGenerativeAIEmbeddings(model="gemini-embedding-001", google_api_key=google_api_key_input)
+                
+                # Embed all document chunks
+                embed_texts = [d.page_content for d in final_documents]
+                vectors = embeddings.embed_documents(embed_texts)
+                
+                text_embeddings = [(d.page_content, v) for d, v in zip(final_documents, vectors)]
+                metadatas = [d.metadata for d in final_documents]
+                vector_store = FAISS.from_embeddings(text_embeddings=text_embeddings, embedding=embeddings, metadatas=metadatas)
+                
+                # Try persisting to MongoDB if connected
+                if mongo_coll is not None:
+                    try:
+                        mongo_coll.delete_many({})
+                        mongo_docs = []
+                        for doc, vec in zip(final_documents, vectors):
+                            mongo_docs.append({
+                                "text": doc.page_content,
+                                "metadata": doc.metadata,
+                                "embedding": vec
+                            })
+                        mongo_coll.insert_many(mongo_docs)
+                        if show_toast:
+                            st.success(f"🍃 Stored {len(final_documents)} vector embeddings in MongoDB database '{mongo_db_name}'!")
+                    except Exception as me:
+                        st.warning(f"⚠️ Vector index created locally, but could not write to MongoDB cluster: {me}. Ensure '0.0.0.0/0' is added to MongoDB Atlas Network Access.")
+                
+                st.session_state.vectors = vector_store
+                st.session_state.doc_count = len(docs)
+                st.session_state.chunk_count = len(final_documents)
+                st.session_state.indexed_files = list(set(loaded_file_names))
+                return True
+            except Exception as e:
+                st.error(f"Error during ingestion: {e}")
+                return False
 
     # Function to load existing vector embeddings directly from MongoDB
     def load_from_mongodb():
         if mongo_coll is None or not google_api_key_input:
             return False
         
-        records = list(mongo_coll.find({}))
-        if not records:
-            return False
-        
         try:
+            records = list(mongo_coll.find({}))
+            if not records:
+                return False
+            
             embeddings = GoogleGenerativeAIEmbeddings(model="gemini-embedding-001", google_api_key=google_api_key_input)
             text_embeddings = [(r["text"], r["embedding"]) for r in records]
             metadatas = [r["metadata"] for r in records]
@@ -267,7 +269,7 @@ with st.sidebar:
             st.session_state.indexed_files = [os.path.basename(f) for f in files]
             return True
         except Exception as e:
-            st.warning(f"Error loading from MongoDB: {e}")
+            st.warning(f"⚠️ Could not read from MongoDB cluster: {e}. Falling back to local ingestion.")
             return False
 
     if st.button("⚡ Ingest & Store in MongoDB", use_container_width=True):
@@ -278,9 +280,9 @@ with st.sidebar:
     # System Status & Reset
     st.subheader("📊 MongoDB Status")
     if st.session_state.vectors is not None:
-        st.markdown(f"**Status:** <span class='status-badge-active'>🟢 MongoDB Active</span>", unsafe_allow_html=True)
+        st.markdown(f"**Status:** <span class='status-badge-active'>🟢 Index Active</span>", unsafe_allow_html=True)
         st.write(f"🍃 **Database:** `{mongo_db_name}`")
-        st.write(f"📄 **Chunks in Cluster:** {st.session_state.chunk_count}")
+        st.write(f"📄 **Chunks Loaded:** {st.session_state.chunk_count}")
         if st.session_state.indexed_files:
             st.caption("Indexed files:")
             for fname in st.session_state.indexed_files:
@@ -290,7 +292,10 @@ with st.sidebar:
         
     if st.button("🗑️ Clear MongoDB Database & Chat", use_container_width=True):
         if mongo_coll is not None:
-            mongo_coll.delete_many({})
+            try:
+                mongo_coll.delete_many({})
+            except Exception:
+                pass
         st.session_state.vectors = None
         st.session_state.messages = []
         st.session_state.doc_count = 0
@@ -302,7 +307,7 @@ with st.sidebar:
 if st.session_state.vectors is None and google_api_key_input:
     loaded = load_from_mongodb()
     if not loaded:
-        with st.spinner("Ingesting documents into MongoDB cluster..."):
+        with st.spinner("Ingesting documents into workspace..."):
             create_and_store_in_mongodb(show_toast=False)
 
 # Main Interface Header
@@ -311,9 +316,9 @@ st.caption("Powered by LangChain + MongoDB Atlas Vector Store + Groq Llama 3.1 +
 
 # Display status banner
 if st.session_state.vectors is None:
-    st.warning("⚠️ **MongoDB vector index is empty.** Click **'⚡ Ingest & Store in MongoDB'** to store document vector embeddings in your cluster.")
+    st.warning("⚠️ **Vector index is empty.** Click **'⚡ Ingest & Store in MongoDB'** to load documents.")
 else:
-    st.info(f"🍃 **MongoDB Connected:** Loaded {st.session_state.chunk_count} vector embeddings directly from MongoDB database **'{mongo_db_name}'**!")
+    st.info(f"🍃 **Ready:** Loaded {st.session_state.chunk_count} vector embeddings from database **'{mongo_db_name}'**!")
 
 # Render existing chat history
 for message in st.session_state.messages:
@@ -324,7 +329,7 @@ for message in st.session_state.messages:
             st.caption(f"⏱️ Response time: {message['response_time']:.2f} seconds")
             
         if "sources" in message and message["sources"]:
-            with st.expander(f"🔍 View {len(message['sources'])} Retrieved MongoDB Context Passages"):
+            with st.expander(f"🔍 View {len(message['sources'])} Retrieved Context Passages"):
                 for i, doc in enumerate(message["sources"]):
                     source_name = doc.metadata.get("source", "Document")
                     page_num = doc.metadata.get("page", 0) + 1
@@ -332,7 +337,7 @@ for message in st.session_state.messages:
                     st.markdown(f"<div class='source-box'>{doc.page_content}</div>", unsafe_allow_html=True)
 
 # Chat Input & RAG Pipeline Execution
-user_query = st.chat_input("Ask a question about your documents stored in MongoDB...")
+user_query = st.chat_input("Ask a question about your documents...")
 
 if user_query:
     st.session_state.messages.append({"role": "user", "content": user_query})
@@ -351,7 +356,7 @@ if user_query:
         
         if st.session_state.vectors is not None:
             try:
-                with st.spinner("Retrieving passages from MongoDB & generating answer..."):
+                with st.spinner("Retrieving passages & generating answer..."):
                     llm = ChatGroq(
                         groq_api_key=groq_api_key_input,
                         model=model_choice,
@@ -360,7 +365,7 @@ if user_query:
 
                     prompt_template = """
                     You are an intelligent document question-answering assistant.
-                    Answer the user's question accurately and thoroughly based on the provided document context passages retrieved from MongoDB.
+                    Answer the user's question accurately and thoroughly based on the provided document context passages.
                     Be sure to synthesize code samples, mathematical formulas, algorithms, and textual explanations present in the context.
                     If the provided context does not contain any relevant information to answer the question, clearly state that the provided context does not contain sufficient details.
 
@@ -393,7 +398,7 @@ if user_query:
                     st.caption(f"⏱️ Response time: {elapsed_time:.2f} seconds")
 
                     if retrieved_docs:
-                        with st.expander(f"🔍 View {len(retrieved_docs)} Retrieved MongoDB Context Passages"):
+                        with st.expander(f"🔍 View {len(retrieved_docs)} Retrieved Context Passages"):
                             for i, doc in enumerate(retrieved_docs):
                                 source_name = doc.metadata.get("source", "Document")
                                 page_num = doc.metadata.get("page", 0) + 1
