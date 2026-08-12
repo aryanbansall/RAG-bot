@@ -80,11 +80,12 @@ def get_secret(key_name, fallback_key=None):
         return os.getenv(fallback_key) or ""
     return ""
 
-# Retrieve configured keys strictly from environment / secrets (NO HARDCODED FALLBACKS)
+# Retrieve configured keys strictly from environment / secrets
 default_groq_key = get_secret("API_KEY", "GROQ_API_KEY")
 default_google_key = get_secret("GOOGLE_API_KEY")
 default_mongo_uri = get_secret("MONGODB_URI")
 mongo_db_name = get_secret("MONGODB_DB_NAME") or "RAG-bot"
+admin_secret_key = get_secret("ADMIN_SECRET_KEY") or "admin123"
 mongo_collection_name = "vector_index"
 
 # Initialize Session State Variables
@@ -166,213 +167,202 @@ with st.sidebar:
     
     st.markdown("---")
     
-    # Document Ingestion Section
+    # Access Control: Read-Only Public vs Admin Ingestion
+    st.subheader("🛡️ Access Control")
+    admin_input = st.text_input("Admin Password (to upload/ingest documents)", type="password", help="Public visitors have Read-Only query access. Enter password to write new documents.")
+    is_admin = (admin_input == admin_secret_key)
+    
+    if is_admin:
+        st.success("🔓 Admin Mode Active: Document Ingestion Unlocked")
+    else:
+        st.info("👁️ Public Read-Only Mode: Queries enabled, database write access locked.")
+
+    st.markdown("---")
+    
+    # Document Ingestion Section (Protected for Admin)
     st.subheader("📥 Document Ingestion")
-    load_assets = st.checkbox("Include `./Assets` directory PDFs", value=True)
     
-    assets_files = []
-    if os.path.exists("./Assets"):
-        assets_files = [f for f in os.listdir("./Assets") if f.endswith(".pdf")]
-    
-    if assets_files:
-        st.caption(f"📁 Found {len(assets_files)} PDF(s) in `./Assets`:")
-        for f in assets_files:
-            st.markdown(f"<div class='file-badge'>📄 {f}</div>", unsafe_allow_html=True)
-            
-    uploaded_files = st.file_uploader("Upload Custom PDF Documents", type=["pdf"], accept_multiple_files=True)
-    
-    with st.expander("🛠️ Advanced Chunking Settings"):
-        chunk_size = st.number_input("Chunk Size", min_value=100, max_value=4000, value=1000, step=100)
-        chunk_overlap = st.number_input("Chunk Overlap", min_value=0, max_value=1000, value=200, step=50)
-
-    # Ingest documents with EXACT RESUME from rate limit pause & LIVE UI status feedback
-    def create_and_store_in_mongodb(show_toast=True):
-        if not google_api_key_input:
-            st.error("Google API Key is required to generate vector embeddings!")
-            return False
-
-        docs = []
-        loaded_file_names = []
+    if is_admin:
+        load_assets = st.checkbox("Include `./Assets` directory PDFs", value=True)
         
-        if load_assets and os.path.exists("./Assets"):
-            try:
-                assets_loader = PyPDFDirectoryLoader("./Assets")
-                assets_docs = assets_loader.load()
-                docs.extend(assets_docs)
-                loaded_file_names.extend(assets_files)
-            except Exception as e:
-                st.warning(f"Could not load documents from ./Assets: {e}")
+        assets_files = []
+        if os.path.exists("./Assets"):
+            assets_files = [f for f in os.listdir("./Assets") if f.endswith(".pdf")]
         
-        if uploaded_files:
-            for file in uploaded_files:
-                with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_file:
-                    tmp_file.write(file.getvalue())
-                    tmp_path = tmp_file.name
+        if assets_files:
+            st.caption(f"📁 Found {len(assets_files)} PDF(s) in `./Assets`:")
+            for f in assets_files:
+                st.markdown(f"<div class='file-badge'>📄 {f}</div>", unsafe_allow_html=True)
                 
+        uploaded_files = st.file_uploader("Upload Custom PDF Documents", type=["pdf"], accept_multiple_files=True)
+        
+        with st.expander("🛠️ Advanced Chunking Settings"):
+            chunk_size = st.number_input("Chunk Size", min_value=100, max_value=4000, value=1000, step=100)
+            chunk_overlap = st.number_input("Chunk Overlap", min_value=0, max_value=1000, value=200, step=50)
+
+        # Ingest documents with EXACT RESUME from rate limit pause & LIVE UI status feedback
+        def create_and_store_in_mongodb(show_toast=True):
+            if not google_api_key_input:
+                st.error("Google API Key is required to generate vector embeddings!")
+                return False
+
+            docs = []
+            loaded_file_names = []
+            
+            if load_assets and os.path.exists("./Assets"):
                 try:
-                    loader = PyPDFLoader(tmp_path)
-                    uploaded_docs = loader.load()
-                    for d in uploaded_docs:
-                        d.metadata["source"] = file.name
-                    docs.extend(uploaded_docs)
-                    loaded_file_names.append(file.name)
+                    assets_loader = PyPDFDirectoryLoader("./Assets")
+                    assets_docs = assets_loader.load()
+                    docs.extend(assets_docs)
+                    loaded_file_names.extend(assets_files)
                 except Exception as e:
-                    st.error(f"Error reading {file.name}: {e}")
-                finally:
-                    if os.path.exists(tmp_path):
-                        os.remove(tmp_path)
-
-        if not docs:
-            st.error("No valid PDF documents found to ingest!")
-            return False
-
-        text_splitter = RecursiveCharacterTextSplitter(chunk_size=chunk_size, chunk_overlap=chunk_overlap)
-        final_documents = text_splitter.split_documents(docs)
-        
-        # 1. Fetch existing cached vector hashes from MongoDB (NO DATABASE WIPING / NO DELETE)
-        existing_records = {}
-        if mongo_coll is not None:
-            try:
-                for r in mongo_coll.find({}, {"doc_id": 1, "text": 1, "metadata": 1, "embedding": 1}):
-                    if "doc_id" in r:
-                        existing_records[r["doc_id"]] = r
-            except Exception:
-                pass
-
-        chunks_to_embed = []
-        cached_tuples = []
-
-        for doc in final_documents:
-            doc_id = hashlib.sha256(f"{doc.page_content}:{doc.metadata.get('source')}:{doc.metadata.get('page')}".encode()).hexdigest()
-            if doc_id in existing_records:
-                rec = existing_records[doc_id]
-                cached_tuples.append((rec["text"], rec["embedding"], rec["metadata"]))
-            else:
-                chunks_to_embed.append((doc_id, doc))
-
-        new_tuples = []
-        use_fallback_model = False
-        
-        if not chunks_to_embed:
-            if show_toast:
-                st.info(f"✨ All {len(cached_tuples)} document chunks are already indexed!")
-        else:
-            status_box = st.status(f"⚡ Ingesting {len(chunks_to_embed)} new chunks into database...", expanded=True)
-            status_box.write(f"✅ Found {len(cached_tuples)} existing chunks in database (reused with 0 API calls).")
+                    st.warning(f"Could not load documents from ./Assets: {e}")
             
-            batch_size = 10
-            current_index = 0
-            total_new = len(chunks_to_embed)
-            
-            while current_index < total_new:
-                batch = chunks_to_embed[current_index : current_index + batch_size]
-                batch_texts = [item[1].page_content for item in batch]
-                
-                provider_label = "Hugging Face Embeddings (Fallback)" if use_fallback_model else "Google Gemini Embeddings"
-                status_box.write(f"🔄 Processing chunk **{current_index + 1}–{min(current_index + len(batch), total_new)}** of **{total_new}** using **{provider_label}**...")
-                
-                embeddings = get_embeddings_model(google_api_key_input, use_fallback=use_fallback_model)
-                
-                embedded_batch = False
-                for attempt in range(3):
+            if uploaded_files:
+                for file in uploaded_files:
+                    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_file:
+                        tmp_file.write(file.getvalue())
+                        tmp_path = tmp_file.name
+                    
                     try:
-                        vecs = embeddings.embed_documents(batch_texts)
-                        mongo_inserts = []
-                        for (doc_id, doc), vec in zip(batch, vecs):
-                            record = {
-                                "doc_id": doc_id,
-                                "text": doc.page_content,
-                                "metadata": doc.metadata,
-                                "embedding": vec
-                            }
-                            mongo_inserts.append(record)
-                            new_tuples.append((doc.page_content, vec, doc.metadata))
-                        
-                        if mongo_coll is not None and mongo_inserts:
-                            try:
-                                mongo_coll.insert_many(mongo_inserts)
-                            except Exception:
-                                pass
-                        
-                        # Advance current_index ONLY when batch completes successfully!
-                        current_index += len(batch)
-                        embedded_batch = True
-                        time.sleep(0.5)
-                        break
+                        loader = PyPDFLoader(tmp_path)
+                        uploaded_docs = loader.load()
+                        for d in uploaded_docs:
+                            d.metadata["source"] = file.name
+                        docs.extend(uploaded_docs)
+                        loaded_file_names.append(file.name)
                     except Exception as e:
-                        err_str = str(e)
-                        if ("429" in err_str or "RESOURCE_EXHAUSTED" in err_str):
-                            if not use_fallback_model:
-                                status_box.warning("⚠️ **Google Gemini Rate Limit (429) hit!** Switching RAG embedding pipeline to **Hugging Face (`all-MiniLM-L6-v2`)**...")
-                                status_box.write(f"📍 **Resuming embedding directly from chunk {current_index + 1}** of {total_new} using Hugging Face (no progress lost)...")
+                        st.error(f"Error reading {file.name}: {e}")
+                    finally:
+                        if os.path.exists(tmp_path):
+                            os.remove(tmp_path)
+
+            if not docs:
+                st.error("No valid PDF documents found to ingest!")
+                return False
+
+            text_splitter = RecursiveCharacterTextSplitter(chunk_size=chunk_size, chunk_overlap=chunk_overlap)
+            final_documents = text_splitter.split_documents(docs)
+            
+            # Fetch existing cached vector hashes from MongoDB
+            existing_records = {}
+            if mongo_coll is not None:
+                try:
+                    for r in mongo_coll.find({}, {"doc_id": 1, "text": 1, "metadata": 1, "embedding": 1}):
+                        if "doc_id" in r:
+                            existing_records[r["doc_id"]] = r
+                except Exception:
+                    pass
+
+            chunks_to_embed = []
+            cached_tuples = []
+
+            for doc in final_documents:
+                doc_id = hashlib.sha256(f"{doc.page_content}:{doc.metadata.get('source')}:{doc.metadata.get('page')}".encode()).hexdigest()
+                if doc_id in existing_records:
+                    rec = existing_records[doc_id]
+                    cached_tuples.append((rec["text"], rec["embedding"], rec["metadata"]))
+                else:
+                    chunks_to_embed.append((doc_id, doc))
+
+            new_tuples = []
+            use_fallback_model = False
+            
+            if not chunks_to_embed:
+                if show_toast:
+                    st.info(f"✨ All {len(cached_tuples)} document chunks are already indexed!")
+            else:
+                status_box = st.status(f"⚡ Ingesting {len(chunks_to_embed)} new chunks into database...", expanded=True)
+                status_box.write(f"✅ Found {len(cached_tuples)} existing chunks in database (reused with 0 API calls).")
+                
+                batch_size = 10
+                current_index = 0
+                total_new = len(chunks_to_embed)
+                
+                while current_index < total_new:
+                    batch = chunks_to_embed[current_index : current_index + batch_size]
+                    batch_texts = [item[1].page_content for item in batch]
+                    
+                    provider_label = "Hugging Face Embeddings (Fallback)" if use_fallback_model else "Google Gemini Embeddings"
+                    status_box.write(f"🔄 Processing chunk **{current_index + 1}–{min(current_index + len(batch), total_new)}** of **{total_new}** using **{provider_label}**...")
+                    
+                    embeddings = get_embeddings_model(google_api_key_input, use_fallback=use_fallback_model)
+                    
+                    embedded_batch = False
+                    for attempt in range(3):
+                        try:
+                            vecs = embeddings.embed_documents(batch_texts)
+                            mongo_inserts = []
+                            for (doc_id, doc), vec in zip(batch, vecs):
+                                record = {
+                                    "doc_id": doc_id,
+                                    "text": doc.page_content,
+                                    "metadata": doc.metadata,
+                                    "embedding": vec
+                                }
+                                mongo_inserts.append(record)
+                                new_tuples.append((doc.page_content, vec, doc.metadata))
+                            
+                            if mongo_coll is not None and mongo_inserts:
+                                try:
+                                    mongo_coll.insert_many(mongo_inserts)
+                                except Exception:
+                                    pass
+                            
+                            current_index += len(batch)
+                            embedded_batch = True
+                            time.sleep(0.5)
+                            break
+                        except Exception as e:
+                            err_str = str(e)
+                            if ("429" in err_str or "RESOURCE_EXHAUSTED" in err_str):
+                                if not use_fallback_model:
+                                    status_box.warning("⚠️ **Google Gemini Rate Limit (429) hit!** Switching RAG embedding pipeline to **Hugging Face (`all-MiniLM-L6-v2`)**...")
+                                    status_box.write(f"📍 **Resuming embedding directly from chunk {current_index + 1}** of {total_new} using Hugging Face (no progress lost)...")
+                                    use_fallback_model = True
+                                    embeddings = get_embeddings_model(google_api_key_input, use_fallback=True)
+                                    time.sleep(1)
+                                else:
+                                    status_box.warning(f"⏳ Rate limit pause. Retrying batch from chunk {current_index + 1} in 4 seconds...")
+                                    time.sleep(4)
+                            else:
+                                status_box.warning(f"⚠️ Provider message: {e}. Switching to Hugging Face fallback from chunk {current_index + 1}...")
                                 use_fallback_model = True
                                 embeddings = get_embeddings_model(google_api_key_input, use_fallback=True)
                                 time.sleep(1)
-                                # Retry exact batch with Hugging Face
-                            else:
-                                status_box.warning(f"⏳ Rate limit pause. Retrying batch from chunk {current_index + 1} in 4 seconds...")
-                                time.sleep(4)
-                        else:
-                            status_box.warning(f"⚠️ Provider message: {e}. Switching to Hugging Face fallback from chunk {current_index + 1}...")
-                            use_fallback_model = True
-                            embeddings = get_embeddings_model(google_api_key_input, use_fallback=True)
-                            time.sleep(1)
-                
-                if not embedded_batch and not use_fallback_model:
-                    use_fallback_model = True
+                    
+                    if not embedded_batch and not use_fallback_model:
+                        use_fallback_model = True
 
-            status_box.update(label="🎉 Document Ingestion Complete!", state="complete", expanded=False)
+                status_box.update(label="🎉 Document Ingestion Complete!", state="complete", expanded=False)
 
-        all_tuples = cached_tuples + new_tuples
-        text_embeddings = [(t[0], t[1]) for t in all_tuples]
-        metadatas = [t[2] for t in all_tuples]
-        
-        active_embeddings = get_embeddings_model(google_api_key_input, use_fallback=use_fallback_model)
-        vector_store = FAISS.from_embeddings(text_embeddings=text_embeddings, embedding=active_embeddings, metadatas=metadatas)
-        
-        st.session_state.vectors = vector_store
-        st.session_state.doc_count = len(docs)
-        st.session_state.chunk_count = len(all_tuples)
-        st.session_state.indexed_files = list(set(loaded_file_names))
-        
-        if show_toast:
-            st.success(f"🍃 RAG Index Ready! Loaded {len(all_tuples)} chunks ({len(cached_tuples)} reused, {len(new_tuples)} new).")
-        return True
-
-    # Function to load existing vector embeddings directly from MongoDB
-    def load_from_mongodb():
-        if mongo_coll is None or not google_api_key_input:
-            return False
-        
-        try:
-            records = list(mongo_coll.find({}))
-            if not records:
-                return False
+            all_tuples = cached_tuples + new_tuples
+            text_embeddings = [(t[0], t[1]) for t in all_tuples]
+            metadatas = [t[2] for t in all_tuples]
             
-            embeddings = get_embeddings_model(google_api_key_input, use_fallback=False)
-            text_embeddings = [(r["text"], r["embedding"]) for r in records]
-            metadatas = [r["metadata"] for r in records]
-            vector_store = FAISS.from_embeddings(text_embeddings=text_embeddings, embedding=embeddings, metadatas=metadatas)
+            active_embeddings = get_embeddings_model(google_api_key_input, use_fallback=use_fallback_model)
+            vector_store = FAISS.from_embeddings(text_embeddings=text_embeddings, embedding=active_embeddings, metadatas=metadatas)
             
-            files = list(set(m.get("source", "Document") for m in metadatas))
             st.session_state.vectors = vector_store
-            st.session_state.doc_count = len(records)
-            st.session_state.chunk_count = len(records)
-            st.session_state.indexed_files = [os.path.basename(f) for f in files]
+            st.session_state.doc_count = len(docs)
+            st.session_state.chunk_count = len(all_tuples)
+            st.session_state.indexed_files = list(set(loaded_file_names))
+            
+            if show_toast:
+                st.success(f"🍃 RAG Index Ready! Loaded {len(all_tuples)} chunks ({len(cached_tuples)} reused, {len(new_tuples)} new).")
             return True
-        except Exception as e:
-            st.warning(f"⚠️ Could not read from MongoDB cluster: {e}. Falling back to local ingestion.")
-            return False
 
-    if st.button("⚡ Ingest & Sync Vector Index", use_container_width=True):
-        create_and_store_in_mongodb(show_toast=True)
-        
+        if st.button("⚡ Ingest & Sync Vector Index", use_container_width=True):
+            create_and_store_in_mongodb(show_toast=True)
+    else:
+        st.warning("🔒 Document upload and ingestion are disabled for public visitors.")
+
     st.markdown("---")
     
-    # System Status & Reset (UI Chat Feed Only - NO DATABASE DELETION)
+    # System Status & Chat Clear
     st.subheader("📊 Workspace Status")
     if st.session_state.vectors is not None:
-        st.markdown(f"**Status:** <span class='status-badge-active'>🟢 Index Active</span>", unsafe_allow_html=True)
+        st.markdown(f"**Status:** <span class='status-badge-active'>🟢 Index Active (Read-Only)</span>", unsafe_allow_html=True)
         st.write(f"🍃 **Database:** `{mongo_db_name}`")
         st.write(f"📄 **Chunks Loaded:** {st.session_state.chunk_count}")
         if st.session_state.indexed_files:
@@ -386,12 +376,35 @@ with st.sidebar:
         st.session_state.messages = []
         st.rerun()
 
-# Auto-load existing vectors from MongoDB on app launch, or ingest if database is empty
+# Read-Only Function to load existing vector embeddings from MongoDB for Public users
+def load_from_mongodb():
+    if mongo_coll is None or not google_api_key_input:
+        return False
+    
+    try:
+        # Strictly READ-ONLY query (.find)
+        records = list(mongo_coll.find({}))
+        if not records:
+            return False
+        
+        embeddings = get_embeddings_model(google_api_key_input, use_fallback=False)
+        text_embeddings = [(r["text"], r["embedding"]) for r in records]
+        metadatas = [r["metadata"] for r in records]
+        vector_store = FAISS.from_embeddings(text_embeddings=text_embeddings, embedding=embeddings, metadatas=metadatas)
+        
+        files = list(set(m.get("source", "Document") for m in metadatas))
+        st.session_state.vectors = vector_store
+        st.session_state.doc_count = len(records)
+        st.session_state.chunk_count = len(records)
+        st.session_state.indexed_files = [os.path.basename(f) for f in files]
+        return True
+    except Exception as e:
+        st.warning(f"⚠️ Could not read from MongoDB cluster: {e}.")
+        return False
+
+# Auto-load existing vectors from MongoDB on app launch for all users (Public & Admin)
 if st.session_state.vectors is None and google_api_key_input:
     loaded = load_from_mongodb()
-    if not loaded:
-        with st.spinner("Ingesting documents into workspace..."):
-            create_and_store_in_mongodb(show_toast=False)
 
 # Main Interface Header
 st.title("💬 Document Question Answering System")
@@ -399,9 +412,9 @@ st.caption("Powered by LangChain + MongoDB Atlas Vector Store + Groq Llama 3.1 +
 
 # Display status banner
 if st.session_state.vectors is None:
-    st.warning("⚠️ **Vector index is empty.** Click **'⚡ Ingest & Sync Vector Index'** to load documents.")
+    st.warning("⚠️ **Vector index is empty.** Administrator must ingest documents.")
 else:
-    st.info(f"🍃 **Ready:** Loaded {st.session_state.chunk_count} vector embeddings from database **'{mongo_db_name}'**!")
+    st.info(f"🍃 **Read-Only Mode Active:** Public visitors can search and query {st.session_state.chunk_count} vector embeddings from database **'{mongo_db_name}'**.")
 
 # Render existing chat history
 for message in st.session_state.messages:
@@ -419,7 +432,7 @@ for message in st.session_state.messages:
                     st.markdown(f"**Source {i+1}:** `{os.path.basename(source_name)}` (Page {page_num})")
                     st.markdown(f"<div class='source-box'>{doc.page_content}</div>", unsafe_allow_html=True)
 
-# Chat Input & RAG Pipeline Execution with Groq LLM & Fallback Handling
+# Chat Input & RAG Pipeline Execution with Groq LLM (Public Read-Only Access)
 user_query = st.chat_input("Ask a question about your documents...")
 
 if user_query:
@@ -432,14 +445,14 @@ if user_query:
         if not groq_api_key_input:
             st.error("Missing Groq API Key! Please enter it in the sidebar.")
         elif st.session_state.vectors is None:
-            success = load_from_mongodb() or create_and_store_in_mongodb(show_toast=False)
+            success = load_from_mongodb()
             if not success:
-                st.error("Please click '⚡ Ingest & Sync Vector Index' in the sidebar to index your documents.")
+                st.error("No documents loaded in database. Administrator must perform initial ingestion.")
                 st.stop()
         
         if st.session_state.vectors is not None:
             try:
-                with st.spinner("Retrieving passages & generating answer with Groq LLM..."):
+                with st.spinner("Searching MongoDB & generating answer with Groq LLM..."):
                     try:
                         llm = ChatGroq(
                             groq_api_key=groq_api_key_input,
