@@ -12,3 +12,5 @@ google-cloud-aiplatform>=1.38
 pymongo
 langchain-mongodb
 dnspython
+sentence-transformers
+langchain-huggingface
