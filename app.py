@@ -473,7 +473,7 @@ with st.sidebar:
     # LLM Selector
     model_choice = st.selectbox(
         "Select Model",
-        ["lallam-2-7b", "lallam-2-7b", "mixtral-8x7b-32768"],
+        ["llama-2-7b", "llama-2-7b", "mixtral-8x7b-32768"],
         index=0
     )
     
